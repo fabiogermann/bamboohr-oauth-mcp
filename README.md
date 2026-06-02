@@ -98,12 +98,47 @@ docker run --rm -p 3000:3000 \
   - liveness: `GET /healthz`
   - readiness: `GET /healthz`
 - Rotation: changing `WRAPPER_ENC_KEY_BASE64` invalidates all outstanding bearers AND any in-flight OAuth state (users must restart any auth dance and re-auth). This is the documented revocation mechanism for a stateless deployment.
-- Multi-replica: no sticky routing required. Bearer and OAuth state are both self-contained encrypted tokens; any pod can serve any request.
+- Multi-replica: every token is a self-contained encrypted ciphertext; any pod can serve any request. **For best concurrent-refresh behavior, enable Authorization-header affinity at the ingress** (see below). Without it, the per-pod single-flight only deduplicates collisions that happen to land on the same replica.
 - The upstream client's 5-min response cache is effectively disabled (fresh per-request client). For high-traffic deployments where this matters, add a wrapper-layer cache keyed by `(userSubject, endpoint)`.
+
+### Ingress affinity (recommended for multi-replica)
+
+The adapter has a per-process single-flight that coalesces concurrent refreshes of the same bearer into one upstream call. To make that effective when running multiple replicas, route requests carrying the same `Authorization` header to the same pod.
+
+**nginx-ingress** — annotate the Ingress:
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/upstream-hash-by: "$http_authorization"
+```
+
+**Traefik v2** — add a `headerValue` sticky service or use the consistent-hash load balancer:
+
+```yaml
+apiVersion: traefik.containo.us/v1alpha1
+kind: TraefikService
+metadata:
+  name: bamboohr-mcp-affinity
+spec:
+  weighted:
+    services:
+      - name: bamboohr-oauth-mcp
+        port: 3000
+    sticky:
+      cookie:
+        name: lb
+```
+
+(Traefik also supports hashing by header via `IPWhiteList` middleware variants, but a cookie-based stickiness is the easiest portable path.)
+
+**Envoy / Istio** — `DestinationRule` with `consistentHash` on `httpHeaderName: Authorization`.
+
+With ingress affinity, concurrent refreshes for the same bearer always hit the same pod and collapse to a single BambooHR `token.php` call. Without it, the worst case is N concurrent refreshes across N pods — bounded but not zero.
 
 ## Caveats (read before deploying)
 
 - **BambooHR OAuth requires marketplace approval.** Apply for it before you need this in production; the process takes calendar time.
 - **No per-user revocation.** Bearer TTL bounds replay. Lower `WRAPPER_BEARER_TTL_SECONDS` if you need tighter recovery from credential leakage.
-- **Concurrent refresh.** Two simultaneous in-flight requests on the same bearer can both trigger refresh. If BambooHR rotates refresh tokens (single-use), one request will fail with `upstream_refresh_failed` and the affected client will need to re-auth. Mitigation requires either ingress-level sticky routing of bearers + a per-pod single-flight lock, or a distributed lock (Redis). Neither is in v0.1.
-- **In-flight OAuth state survives pod death but not key rotation.** The `state` param is itself an encrypted token containing only timestamp + nonce. Rotating `WRAPPER_ENC_KEY_BASE64` mid-flow breaks any user who hasn't completed the callback yet.
+- **Authorization codes are not one-shot enforced.** RFC 6749 §4.1.2 says auth codes MUST be single-use. Enforcing that would require shared state (database/Redis). Instead, PKCE provides the security guarantee: an attacker who captures a redirect URL cannot exchange it without the `code_verifier`, which only the legitimate client holds. A legitimate client that retries `/token` within the 60s TTL gets the same wrapper bearer back (idempotent, not exploitable). This is a documented stateless trade-off.
+- **In-flight OAuth state survives pod death but not key rotation.** The `state` param is itself an encrypted token. Rotating `WRAPPER_ENC_KEY_BASE64` mid-flow breaks any user who hasn't completed the callback yet.

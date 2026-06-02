@@ -62,6 +62,7 @@ import {
 import { makeOAuthClient } from './oauth-bamboohr-client.js';
 import { requestCtx } from './als.js';
 import { buildServer } from './server.js';
+import { bearerKey, singleFlight } from './refresh.js';
 
 // Lifetime of the encrypted AuthRequest (state for the BambooHR round-trip).
 // The user has this many seconds to log in at BambooHR and consent.
@@ -120,6 +121,7 @@ function mintBearer(cfg: Config, token: {
 
 async function ensureFreshUpstream(
   cfg: Config,
+  rawBearer: string,
   payload: BearerPayload,
 ): Promise<{ payload: BearerPayload; rotated: boolean }> {
   if (payload.ate - nowSec() > cfg.refreshSkewSeconds) {
@@ -131,7 +133,14 @@ async function ensureFreshUpstream(
       401,
     );
   }
-  const fresh = await refreshAccessToken(cfg, payload.rt);
+  // Coalesce concurrent refreshes for the same bearer to one upstream call.
+  // The captured rt is the one from the bearer the FIRST caller decrypted;
+  // racing callers may carry the same rt or a stale rt — either way, the
+  // post-refresh payload returned here is the authoritative result and is
+  // re-encrypted into a fresh wrapper bearer by /mcp.
+  const fresh = await singleFlight(`rt:${bearerKey(rawBearer)}`, () =>
+    refreshAccessToken(cfg, payload.rt as string),
+  );
   const newPayload: BearerPayload = {
     ...payload,
     at: fresh.access_token,
@@ -410,7 +419,7 @@ export function buildApp(cfg: Config): express.Express {
 
     let rotated = false;
     try {
-      const r = await ensureFreshUpstream(cfg, payload);
+      const r = await ensureFreshUpstream(cfg, raw, payload);
       payload = r.payload;
       rotated = r.rotated;
     } catch (e) {

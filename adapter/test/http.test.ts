@@ -504,4 +504,50 @@ describe('http / /mcp auth gating', () => {
     expect(body.grant_type).toBe('refresh_token');
     expect(body.refresh_token).toBe('old-rt');
   });
+
+  it('coalesces concurrent refreshes on the same bearer to a single upstream call', async () => {
+    let resolveTokenCall: (resp: Response) => void = () => {};
+    const tokenPromise = new Promise<Response>((res) => {
+      resolveTokenCall = res;
+    });
+    const fakeFetch = vi.fn().mockImplementation(() => tokenPromise);
+    global.fetch = fakeFetch as unknown as typeof fetch;
+
+    const token = mintBearerToken({ ate: nowSec() + 1, rt: 'old-rt' });
+    // supertest's Test doesn't dispatch until `.then` is called. Chain a no-op
+    // `.then` on each to force the HTTP request to be sent now; the resulting
+    // promises are awaited later via Promise.all.
+    const send = () =>
+      request(app)
+        .post('/mcp')
+        .set('authorization', `Bearer ${token}`)
+        .set('content-type', 'application/json')
+        .send({})
+        .then((r) => r);
+    const inflight = [send(), send(), send()];
+
+    // Yield enough microtasks for all three /mcp handlers to reach the
+    // singleFlight call. setTimeout(0) flushes pending I/O; one tick is enough
+    // in practice but we use a small delay for safety.
+    await new Promise((r) => setTimeout(r, 30));
+
+    resolveTokenCall(
+      new Response(
+        JSON.stringify({
+          access_token: 'rotated-at',
+          expires_in: 3600,
+          token_type: 'Bearer',
+          scope: 'offline_access',
+          refresh_token: 'rotated-rt',
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ),
+    );
+
+    const results = await Promise.all(inflight);
+    expect(results[0].headers['x-wrapper-token']).toBeTruthy();
+    expect(results[1].headers['x-wrapper-token']).toBeTruthy();
+    expect(results[2].headers['x-wrapper-token']).toBeTruthy();
+    expect(fakeFetch).toHaveBeenCalledTimes(1);
+  });
 });
