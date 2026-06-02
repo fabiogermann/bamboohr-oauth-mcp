@@ -41,7 +41,7 @@ All of this is in `adapter/src/`. ~80 lines of real logic; the rest is OAuth wir
 | `WRAPPER_ENC_KEY_BASE64`          | yes      | —             | 32 bytes, base64. `openssl rand -base64 32` |
 | `PUBLIC_BASE_URL`                 | yes      | —             | External URL of the adapter, e.g. `https://bamboo-mcp.example.com`. Used in OAuth `redirect_uri` and `.well-known` docs. |
 | `PORT`                            | no       | `3000`        | HTTP listen port |
-| `BAMBOOHR_OAUTH_SCOPES`           | yes      | —             | Space- or plus-separated scope list. Sent to BambooHR verbatim — **do not include scopes your app is not configured for** or BambooHR returns `invalid_scope`. Examples seen in the wild: `mcp`, `time_off`, `company:info`, `company:details`, `ask_bamboohr:chat_messages`, `email`, `openid`. `offline_access` is **not** auto-injected; include it explicitly only if your app supports it (some apps don't, and refresh tokens may be issued without it). |
+| `BAMBOOHR_OAUTH_SCOPES`           | no       | `offline_access openid email` | Space- or plus-separated scope list. Sent to BambooHR verbatim — **do not include scopes your app is not configured for** or BambooHR returns `invalid_scope`. `offline_access` is **always appended** if not present (refresh tokens). Examples: `mcp`, `time_off`, `company:info`, `company:details`, `ask_bamboohr:chat_messages`. If your BambooHR OAuth app does not allow `offline_access`, you must reconfigure the app — there is no opt-out at this layer. |
 | `WRAPPER_BEARER_TTL_SECONDS`      | no       | `3600`        | Wrapper bearer lifetime |
 | `WRAPPER_REFRESH_SKEW_SECONDS`    | no       | `60`          | Refresh upstream token if it expires within this many seconds |
 

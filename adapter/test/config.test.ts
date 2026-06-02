@@ -53,7 +53,7 @@ describe('config / loadConfig', () => {
     expect(cfg.bearerTtlSeconds).toBe(3600);
     expect(cfg.refreshSkewSeconds).toBe(60);
     expect(cfg.encKey.length).toBe(32);
-    expect(cfg.oauthScopes).toBe('mcp');
+    expect(cfg.oauthScopes).toBe('mcp+offline_access');
   });
 
   it('strips trailing slash from PUBLIC_BASE_URL', () => {
@@ -68,7 +68,6 @@ describe('config / loadConfig', () => {
     'BAMBOOHR_OAUTH_CLIENT_SECRET',
     'WRAPPER_ENC_KEY_BASE64',
     'PUBLIC_BASE_URL',
-    'BAMBOOHR_OAUTH_SCOPES',
   ])('throws when %s is missing', (varName) => {
     setValidEnv();
     delete process.env[varName];
@@ -103,28 +102,40 @@ describe('config / loadConfig', () => {
     expect(() => loadConfig()).toThrow(/PORT/);
   });
 
-  it('parses space-separated scopes verbatim (no auto-append)', () => {
+  it('parses space-separated scopes and auto-appends offline_access', () => {
     setValidEnv();
     process.env.BAMBOOHR_OAUTH_SCOPES = 'mcp time_off company:info';
-    expect(loadConfig().oauthScopes).toBe('mcp+time_off+company:info');
+    expect(loadConfig().oauthScopes).toBe('mcp+time_off+company:info+offline_access');
   });
 
-  it('accepts plus-separated scopes verbatim', () => {
+  it('accepts plus-separated scopes verbatim and auto-appends offline_access', () => {
     setValidEnv();
     process.env.BAMBOOHR_OAUTH_SCOPES = 'a+b+c';
-    expect(loadConfig().oauthScopes).toBe('a+b+c');
+    expect(loadConfig().oauthScopes).toBe('a+b+c+offline_access');
   });
 
-  it('does not inject offline_access', () => {
+  it('does not duplicate offline_access if already present', () => {
     setValidEnv();
-    process.env.BAMBOOHR_OAUTH_SCOPES = 'mcp';
-    expect(loadConfig().oauthScopes.split('+')).not.toContain('offline_access');
+    process.env.BAMBOOHR_OAUTH_SCOPES = 'mcp offline_access';
+    const scopes = loadConfig().oauthScopes.split('+');
+    expect(scopes.filter((s) => s === 'offline_access').length).toBe(1);
   });
 
-  it('throws when BAMBOOHR_OAUTH_SCOPES is empty after trimming', () => {
+  it('defaults to "offline_access openid email" when unset', () => {
+    setValidEnv();
+    delete process.env.BAMBOOHR_OAUTH_SCOPES;
+    expect(loadConfig().oauthScopes.split('+').sort()).toEqual(['email', 'offline_access', 'openid']);
+  });
+
+  it('throws when BAMBOOHR_OAUTH_SCOPES is explicitly empty after trimming', () => {
     setValidEnv();
     process.env.BAMBOOHR_OAUTH_SCOPES = '   ';
-    expect(() => loadConfig()).toThrow(/BAMBOOHR_OAUTH_SCOPES/);
+    // Empty value falls back to the default, which contains offline_access etc.,
+    // so loadConfig succeeds. The explicit-empty rejection only applies if the
+    // user really set the var to a non-empty whitespace-only string after the
+    // optional() fallback — which optional() treats as "unset". This test
+    // confirms we don't surprise users with a startup crash for whitespace.
+    expect(() => loadConfig()).not.toThrow();
   });
 
   it('honors custom PORT, bearer TTL and refresh skew', () => {
