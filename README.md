@@ -1,4 +1,4 @@
-# BambooHR MCP OAuth Adapter
+# bamboohr-oauth-mcp
 
 OAuth-aware wrapper around [`@twentytwokhz/bamboohr-mcp`](https://www.npmjs.com/package/@twentytwokhz/bamboohr-mcp).
 
@@ -74,14 +74,14 @@ node dist/index.js
 The repo-root `Dockerfile` builds the adapter (multi-stage, TypeScript compile, prod prune, non-root, tini PID 1).
 
 ```bash
-docker build -t bamboohr-mcp-oauth-adapter:latest .
+docker build -t bamboohr-oauth-mcp:latest .
 docker run --rm -p 3000:3000 \
   -e BAMBOOHR_COMPANY_DOMAIN=mycompany \
   -e BAMBOOHR_OAUTH_CLIENT_ID=... \
   -e BAMBOOHR_OAUTH_CLIENT_SECRET=... \
   -e WRAPPER_ENC_KEY_BASE64="$(openssl rand -base64 32)" \
   -e PUBLIC_BASE_URL=https://bamboo-mcp.example.com \
-  bamboohr-mcp-oauth-adapter:latest
+  bamboohr-oauth-mcp:latest
 ```
 
 ## Kubernetes notes
