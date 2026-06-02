@@ -1,0 +1,16 @@
+.git
+.gitignore
+*.md
+Dockerfile
+.dockerignore
+.env
+.env.*
+
+# Adapter
+adapter/node_modules
+adapter/dist
+adapter/*.log
+
+# Other
+sample
+/tmp

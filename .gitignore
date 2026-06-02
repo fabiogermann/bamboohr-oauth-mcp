@@ -1,0 +1,16 @@
+# Node
+node_modules/
+dist/
+coverage/
+*.log
+.env
+.env.local
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local samples (not for distribution)
+sample/
