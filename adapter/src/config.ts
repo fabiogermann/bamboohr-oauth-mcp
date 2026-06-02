@@ -13,7 +13,7 @@ export interface Config {
   // BambooHR OAuth app
   oauthClientId: string;
   oauthClientSecret: string;
-  oauthScopes: string; // plus-separated, offline_access guaranteed
+  oauthScopes: string; // plus-separated, exactly what BambooHR receives
 
   // Bearer encryption
   encKey: Buffer; // 32 bytes, AES-256-GCM
@@ -48,11 +48,20 @@ function parseIntEnv(name: string, fallback: number): number {
 
 function parseScopes(raw: string): string {
   // BambooHR's authorize.php uses '+' as separator. Accept ' ' too and normalize.
+  // We do NOT auto-inject any scope: BambooHR rejects unknown scopes with
+  // invalid_scope, including (in some app configurations) `offline_access`.
+  // Callers must supply exactly the scopes their BambooHR OAuth app is allowed
+  // to request.
   const tokens = raw
     .split(/[\s+]+/)
     .map((s) => s.trim())
     .filter(Boolean);
-  if (!tokens.includes('offline_access')) tokens.push('offline_access');
+  if (tokens.length === 0) {
+    throw new Error(
+      'BAMBOOHR_OAUTH_SCOPES must contain at least one scope. ' +
+        'Set it to the space- or plus-separated list your BambooHR OAuth app supports.',
+    );
+  }
   return tokens.join('+');
 }
 
@@ -90,7 +99,7 @@ export function loadConfig(): Config {
     bambooBaseUrl: `https://${companyDomain}.bamboohr.com`,
     oauthClientId: required('BAMBOOHR_OAUTH_CLIENT_ID'),
     oauthClientSecret: required('BAMBOOHR_OAUTH_CLIENT_SECRET'),
-    oauthScopes: parseScopes(optional('BAMBOOHR_OAUTH_SCOPES', 'offline_access')),
+    oauthScopes: parseScopes(required('BAMBOOHR_OAUTH_SCOPES')),
     encKey: parseKey(required('WRAPPER_ENC_KEY_BASE64')),
     bearerTtlSeconds: parseIntEnv('WRAPPER_BEARER_TTL_SECONDS', 3600),
     refreshSkewSeconds: parseIntEnv('WRAPPER_REFRESH_SKEW_SECONDS', 60),

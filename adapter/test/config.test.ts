@@ -38,6 +38,7 @@ function setValidEnv(): string {
   process.env.BAMBOOHR_OAUTH_CLIENT_SECRET = 'csec';
   process.env.WRAPPER_ENC_KEY_BASE64 = keyB64;
   process.env.PUBLIC_BASE_URL = 'https://adapter.example.com';
+  process.env.BAMBOOHR_OAUTH_SCOPES = 'mcp';
   return keyB64;
 }
 
@@ -52,7 +53,7 @@ describe('config / loadConfig', () => {
     expect(cfg.bearerTtlSeconds).toBe(3600);
     expect(cfg.refreshSkewSeconds).toBe(60);
     expect(cfg.encKey.length).toBe(32);
-    expect(cfg.oauthScopes).toBe('offline_access');
+    expect(cfg.oauthScopes).toBe('mcp');
   });
 
   it('strips trailing slash from PUBLIC_BASE_URL', () => {
@@ -67,6 +68,7 @@ describe('config / loadConfig', () => {
     'BAMBOOHR_OAUTH_CLIENT_SECRET',
     'WRAPPER_ENC_KEY_BASE64',
     'PUBLIC_BASE_URL',
+    'BAMBOOHR_OAUTH_SCOPES',
   ])('throws when %s is missing', (varName) => {
     setValidEnv();
     delete process.env[varName];
@@ -101,23 +103,28 @@ describe('config / loadConfig', () => {
     expect(() => loadConfig()).toThrow(/PORT/);
   });
 
-  it('parses scopes and always appends offline_access', () => {
+  it('parses space-separated scopes verbatim (no auto-append)', () => {
     setValidEnv();
-    process.env.BAMBOOHR_OAUTH_SCOPES = 'read.employees write.timeoff';
-    expect(loadConfig().oauthScopes).toBe('read.employees+write.timeoff+offline_access');
+    process.env.BAMBOOHR_OAUTH_SCOPES = 'mcp time_off company:info';
+    expect(loadConfig().oauthScopes).toBe('mcp+time_off+company:info');
   });
 
-  it('accepts plus-separated scopes', () => {
+  it('accepts plus-separated scopes verbatim', () => {
     setValidEnv();
     process.env.BAMBOOHR_OAUTH_SCOPES = 'a+b+c';
-    expect(loadConfig().oauthScopes).toBe('a+b+c+offline_access');
+    expect(loadConfig().oauthScopes).toBe('a+b+c');
   });
 
-  it('does not duplicate offline_access when already present', () => {
+  it('does not inject offline_access', () => {
     setValidEnv();
-    process.env.BAMBOOHR_OAUTH_SCOPES = 'offline_access read.x';
-    const scopes = loadConfig().oauthScopes.split('+');
-    expect(scopes.filter((s) => s === 'offline_access').length).toBe(1);
+    process.env.BAMBOOHR_OAUTH_SCOPES = 'mcp';
+    expect(loadConfig().oauthScopes.split('+')).not.toContain('offline_access');
+  });
+
+  it('throws when BAMBOOHR_OAUTH_SCOPES is empty after trimming', () => {
+    setValidEnv();
+    process.env.BAMBOOHR_OAUTH_SCOPES = '   ';
+    expect(() => loadConfig()).toThrow(/BAMBOOHR_OAUTH_SCOPES/);
   });
 
   it('honors custom PORT, bearer TTL and refresh skew', () => {
