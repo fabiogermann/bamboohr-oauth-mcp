@@ -7,8 +7,16 @@ import {
   encryptState,
   decryptState,
   StateError,
+  encryptAuthRequest,
+  decryptAuthRequest,
+  AuthRequestError,
+  encryptAuthCode,
+  decryptAuthCode,
+  AuthCodeError,
   type BearerPayload,
   type StatePayload,
+  type AuthRequestPayload,
+  type AuthCodePayload,
 } from '../src/crypto.js';
 
 const KEY = randomBytes(32);
@@ -82,7 +90,7 @@ describe('crypto / bearer', () => {
     const t = encryptBearer(makeBearer(), KEY);
     const buf = Buffer.from(t, 'base64url');
     buf[0] = 99;
-    expect(() => decryptBearer(buf.toString('base64url'), KEY)).toThrow(/unsupported bearer version/);
+    expect(() => decryptBearer(buf.toString('base64url'), KEY)).toThrow(/unsupported token version/);
   });
 
   it('rejects total garbage', () => {
@@ -130,5 +138,71 @@ describe('crypto / bearer vs state separation', () => {
     const s = encryptState(makeState(), KEY);
     expect(() => decryptState(b, KEY)).toThrow(StateError);
     expect(() => decryptBearer(s, KEY)).toThrow(BearerError);
+  });
+});
+
+function makeAuthRequest(): AuthRequestPayload {
+  const now = Math.floor(Date.now() / 1000);
+  return {
+    v: 1,
+    iat: now,
+    exp: now + 600,
+    ci: 'bamboohr-oauth-mcp',
+    ru: 'http://127.0.0.1:39000/callback',
+    cs: 'client-state',
+    cc: 'challenge-b64url',
+    sc: 'mcp time_off',
+  };
+}
+
+describe('crypto / auth request', () => {
+  it('roundtrips', () => {
+    const r = makeAuthRequest();
+    const t = encryptAuthRequest(r, KEY);
+    expect(decryptAuthRequest(t, KEY)).toEqual(r);
+  });
+
+  it('rejects another key', () => {
+    const t = encryptAuthRequest(makeAuthRequest(), KEY);
+    expect(() => decryptAuthRequest(t, OTHER_KEY)).toThrow(AuthRequestError);
+  });
+
+  it('is distinguishable from bearer/state by version byte', () => {
+    const b = encryptBearer(makeBearer(), KEY);
+    const s = encryptState(makeState(), KEY);
+    expect(() => decryptAuthRequest(b, KEY)).toThrow(AuthRequestError);
+    expect(() => decryptAuthRequest(s, KEY)).toThrow(AuthRequestError);
+  });
+});
+
+function makeAuthCode(): AuthCodePayload {
+  const now = Math.floor(Date.now() / 1000);
+  return {
+    v: 1,
+    iat: now,
+    exp: now + 60,
+    b: 'wrapped-bearer-string',
+    ru: 'http://127.0.0.1:39000/callback',
+    cc: 'challenge-b64url',
+    eb: now + 3600,
+    sc: 'mcp',
+  };
+}
+
+describe('crypto / auth code', () => {
+  it('roundtrips', () => {
+    const c = makeAuthCode();
+    const t = encryptAuthCode(c, KEY);
+    expect(decryptAuthCode(t, KEY)).toEqual(c);
+  });
+
+  it('rejects another key', () => {
+    const t = encryptAuthCode(makeAuthCode(), KEY);
+    expect(() => decryptAuthCode(t, OTHER_KEY)).toThrow(AuthCodeError);
+  });
+
+  it('is distinguishable from auth request by version byte', () => {
+    const r = encryptAuthRequest(makeAuthRequest(), KEY);
+    expect(() => decryptAuthCode(r, KEY)).toThrow(AuthCodeError);
   });
 });

@@ -12,6 +12,8 @@ const REQUIRED_KEYS = [
   'BAMBOOHR_OAUTH_SCOPES',
   'WRAPPER_BEARER_TTL_SECONDS',
   'WRAPPER_REFRESH_SKEW_SECONDS',
+  'OAUTH_ALLOWED_REDIRECT_URIS',
+  'OAUTH_AUTH_CODE_TTL_SECONDS',
 ];
 
 let saved: Record<string, string | undefined>;
@@ -39,6 +41,7 @@ function setValidEnv(): string {
   process.env.WRAPPER_ENC_KEY_BASE64 = keyB64;
   process.env.PUBLIC_BASE_URL = 'https://adapter.example.com';
   process.env.BAMBOOHR_OAUTH_SCOPES = 'mcp';
+  process.env.OAUTH_ALLOWED_REDIRECT_URIS = 'http://127.0.0.1:39000/callback';
   return keyB64;
 }
 
@@ -54,6 +57,8 @@ describe('config / loadConfig', () => {
     expect(cfg.refreshSkewSeconds).toBe(60);
     expect(cfg.encKey.length).toBe(32);
     expect(cfg.oauthScopes).toBe('mcp+offline_access');
+    expect(cfg.allowedRedirectUris).toEqual(['http://127.0.0.1:39000/callback']);
+    expect(cfg.authCodeTtlSeconds).toBe(60);
   });
 
   it('strips trailing slash from PUBLIC_BASE_URL', () => {
@@ -68,10 +73,33 @@ describe('config / loadConfig', () => {
     'BAMBOOHR_OAUTH_CLIENT_SECRET',
     'WRAPPER_ENC_KEY_BASE64',
     'PUBLIC_BASE_URL',
+    'OAUTH_ALLOWED_REDIRECT_URIS',
   ])('throws when %s is missing', (varName) => {
     setValidEnv();
     delete process.env[varName];
     expect(() => loadConfig()).toThrow(new RegExp(varName));
+  });
+
+  it('parses multiple redirect URIs from comma-separated env', () => {
+    setValidEnv();
+    process.env.OAUTH_ALLOWED_REDIRECT_URIS =
+      'cursor://anysphere.cursor-deeplink/sso/login, http://127.0.0.1:39000/callback';
+    expect(loadConfig().allowedRedirectUris).toEqual([
+      'cursor://anysphere.cursor-deeplink/sso/login',
+      'http://127.0.0.1:39000/callback',
+    ]);
+  });
+
+  it('throws on an invalid redirect URI', () => {
+    setValidEnv();
+    process.env.OAUTH_ALLOWED_REDIRECT_URIS = 'http://valid/ok, not a uri';
+    expect(() => loadConfig()).toThrow(/invalid URI/);
+  });
+
+  it('honors custom OAUTH_AUTH_CODE_TTL_SECONDS', () => {
+    setValidEnv();
+    process.env.OAUTH_AUTH_CODE_TTL_SECONDS = '120';
+    expect(loadConfig().authCodeTtlSeconds).toBe(120);
   });
 
   it('throws on invalid company domain', () => {

@@ -6,14 +6,18 @@ OAuth-aware wrapper around [`@twentytwokhz/bamboohr-mcp`](https://www.npmjs.com/
 
 ## How it works
 
+This adapter is a full OAuth 2.0 Authorization Server in front of BambooHR. MCP clients (Cursor, Claude Desktop, etc.) discover it via `/.well-known/oauth-authorization-server`, dance with `/authorize` → `/token` using PKCE S256, and end up with an opaque wrapper bearer they pass to `POST /mcp`.
+
 1. **One BambooHR OAuth app** (registered in the BambooHR Developer Portal).
 2. **One adapter deployment** scoped to **one BambooHR tenant** (set via `BAMBOOHR_COMPANY_DOMAIN`).
-3. User browses to `/connect/start`, gets redirected to BambooHR, authorizes, and BambooHR redirects back to `/connect/callback`.
-4. Adapter exchanges the auth code for `{access_token, refresh_token}`, encrypts those into a self-contained wrapper bearer (AES-256-GCM, 32-byte key), and returns it to the user.
-5. User calls `POST /mcp` with `Authorization: Bearer <wrapper-bearer>`.
-6. Adapter decrypts, refreshes the upstream BambooHR token if it expires within `WRAPPER_REFRESH_SKEW_SECONDS`, constructs a fresh `BambooHRClient` configured with the user's access token, runs the MCP request inside an `AsyncLocalStorage` scope. If the wrapper bearer was re-minted due to refresh, it's returned in the `X-Wrapper-Token` response header.
+3. MCP client browser-redirects user to `/authorize?response_type=code&client_id=...&redirect_uri=...&state=...&code_challenge=...&code_challenge_method=S256&scope=...`.
+4. Adapter validates the request (PKCE mandatory, `redirect_uri` must be in the env allowlist), encrypts the client's parameters into an AES-256-GCM `AuthRequest` token, and 302-redirects the user to BambooHR's `authorize.php` carrying that token as `state`.
+5. User authorizes at BambooHR; BambooHR redirects to `<PUBLIC_BASE_URL>/connect/callback?code=...&state=...`.
+6. Adapter decrypts the state, exchanges the BambooHR `code` for `{access_token, refresh_token}`, mints a wrapper bearer (encrypted, self-contained), wraps that bearer in an encrypted one-time `AuthCode` carrying the original PKCE challenge + client redirect, and 302-redirects to the **client's** `redirect_uri` with `code=<auth_code>&state=<original_client_state>`.
+7. Client POSTs `/token` with `grant_type=authorization_code`, `code`, `redirect_uri`, `code_verifier`. Adapter decrypts the code, verifies PKCE (`sha256(verifier) == challenge`), verifies redirect match, returns the wrapper bearer as the `access_token`.
+8. Client calls `POST /mcp` with `Authorization: Bearer <wrapper-bearer>`. Adapter decrypts, refreshes upstream BambooHR token if it expires within `WRAPPER_REFRESH_SKEW_SECONDS`, constructs a fresh `BambooHRClient` configured with the user's access token, runs the MCP request inside `AsyncLocalStorage`. If the wrapper was re-minted on refresh, it's returned in the `X-Wrapper-Token` response header.
 
-No database. No session state. Adapter pods are horizontally scalable: both the wrapper bearer and the OAuth `state` parameter are AES-256-GCM-encrypted self-contained tokens, so any replica can handle any request. The only shared dependency is the encryption key.
+No database. No session state. Adapter pods are horizontally scalable: every token (wrapper bearer, OAuth `state`/AuthRequest, one-time AuthCode) is an AES-256-GCM self-contained ciphertext; any replica can handle any request. The only shared dependency is the encryption key.
 
 ## Why an "adapter" and not a fork
 
@@ -40,25 +44,28 @@ All of this is in `adapter/src/`. ~80 lines of real logic; the rest is OAuth wir
 | `BAMBOOHR_OAUTH_CLIENT_SECRET`    | yes      | —             | From BambooHR Developer Portal |
 | `WRAPPER_ENC_KEY_BASE64`          | yes      | —             | 32 bytes, base64. `openssl rand -base64 32` |
 | `PUBLIC_BASE_URL`                 | yes      | —             | External URL of the adapter, e.g. `https://bamboo-mcp.example.com`. Used in OAuth `redirect_uri` and `.well-known` docs. |
+| `OAUTH_ALLOWED_REDIRECT_URIS`     | yes      | —             | Comma-separated allowlist of MCP-client redirect URIs. `/authorize`, `/register`, and `/connect/callback` all reject any URI not in this list (open-redirect protection). Example: `cursor://anysphere.cursor-deeplink/sso/login,http://127.0.0.1:39000/callback`. Exact-string match, case-sensitive. |
 | `PORT`                            | no       | `3000`        | HTTP listen port |
 | `BAMBOOHR_OAUTH_SCOPES`           | no       | `offline_access openid email` | Space- or plus-separated scope list. Sent to BambooHR verbatim — **do not include scopes your app is not configured for** or BambooHR returns `invalid_scope`. `offline_access` is **always appended** if not present (refresh tokens). Examples: `mcp`, `time_off`, `company:info`, `company:details`, `ask_bamboohr:chat_messages`. If your BambooHR OAuth app does not allow `offline_access`, you must reconfigure the app — there is no opt-out at this layer. |
 | `WRAPPER_BEARER_TTL_SECONDS`      | no       | `3600`        | Wrapper bearer lifetime |
 | `WRAPPER_REFRESH_SKEW_SECONDS`    | no       | `60`          | Refresh upstream token if it expires within this many seconds |
+| `OAUTH_AUTH_CODE_TTL_SECONDS`     | no       | `60`          | TTL of the one-time authorization code returned from `/connect/callback`. Keep short. |
 
-Register your redirect URI in the BambooHR Developer Portal as exactly: `<PUBLIC_BASE_URL>/connect/callback`.
+Register your redirect URI in the **BambooHR** Developer Portal as exactly: `<PUBLIC_BASE_URL>/connect/callback`. (This is the adapter's callback from BambooHR — distinct from the MCP-client redirect URIs you list in `OAUTH_ALLOWED_REDIRECT_URIS`.)
 
 ## Endpoints
 
 | Method | Path                                          | Description |
 |--------|-----------------------------------------------|-------------|
 | GET    | `/healthz`                                    | Liveness/info |
-| GET    | `/connect/start`                              | Begin OAuth — 302 to BambooHR `authorize.php` |
-| GET    | `/connect/callback`                           | OAuth callback; returns `{access_token, expires_in, scope}` (access_token is the wrapper bearer) |
+| GET    | `/authorize`                                  | Client-facing OAuth AS endpoint. Requires `response_type=code`, `client_id`, `redirect_uri` (in allowlist), `state`, `code_challenge`, `code_challenge_method=S256`, optional `scope`. 302s to BambooHR. |
+| GET    | `/connect/callback`                           | BambooHR returns here. Mints a one-time auth code and 302s to the client's `redirect_uri` with `code` + original `state`. |
+| POST   | `/token`                                      | OAuth token endpoint. Body (form-urlencoded or JSON): `grant_type=authorization_code`, `code`, `redirect_uri`, `code_verifier`. Returns `{access_token, token_type:"Bearer", expires_in, scope}`. |
 | POST   | `/mcp`                                        | MCP Streamable HTTP. Requires `Authorization: Bearer <wrapper-bearer>`. May return `X-Wrapper-Token` if upstream was refreshed. |
 | POST   | `/disconnect`                                 | No-op (stateless); discard the bearer client-side |
-| GET    | `/.well-known/oauth-authorization-server`    | OAuth AS metadata |
+| GET    | `/.well-known/oauth-authorization-server`    | OAuth AS metadata (issuer, /authorize, /token, /register, S256, scopes) |
 | GET    | `/.well-known/oauth-protected-resource`      | OAuth resource metadata |
-| POST   | `/register`                                   | Dynamic Client Registration stub |
+| POST   | `/register`                                   | Dynamic Client Registration (RFC 7591). Validates requested `redirect_uris` against the env allowlist. |
 
 ## Local dev
 

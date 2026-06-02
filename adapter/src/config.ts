@@ -21,6 +21,13 @@ export interface Config {
   // Tunables
   bearerTtlSeconds: number; // wrapper bearer lifetime (independent of upstream access_token expiry)
   refreshSkewSeconds: number; // refresh upstream token if it expires within this many seconds
+  authCodeTtlSeconds: number; // short-lived /authorize → /token authorization code lifetime
+
+  // OAuth Authorization Server: allow-list of MCP-client redirect_uris.
+  // Comma-separated env. Matched literally (case-sensitive, exact-string).
+  // Required because we act as a real Authorization Server and must reject
+  // unknown destinations to prevent open-redirect abuse.
+  allowedRedirectUris: string[];
 }
 
 function required(name: string): string {
@@ -83,6 +90,29 @@ function parseKey(b64: string): Buffer {
   return buf;
 }
 
+function parseRedirectUris(raw: string): string[] {
+  const tokens = raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (tokens.length === 0) {
+    throw new Error(
+      'OAUTH_ALLOWED_REDIRECT_URIS must contain at least one URI. ' +
+        'Provide a comma-separated list of MCP-client redirect_uri values, e.g. ' +
+        '"cursor://anysphere.cursor-deeplink/sso/login,http://127.0.0.1:39000/callback".',
+    );
+  }
+  for (const u of tokens) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const _ = new URL(u);
+    } catch {
+      throw new Error(`OAUTH_ALLOWED_REDIRECT_URIS contains invalid URI: ${u}`);
+    }
+  }
+  return tokens;
+}
+
 export function loadConfig(): Config {
   const companyDomain = required('BAMBOOHR_COMPANY_DOMAIN');
   if (!/^[a-z0-9][a-z0-9-]*$/i.test(companyDomain)) {
@@ -105,5 +135,7 @@ export function loadConfig(): Config {
     encKey: parseKey(required('WRAPPER_ENC_KEY_BASE64')),
     bearerTtlSeconds: parseIntEnv('WRAPPER_BEARER_TTL_SECONDS', 3600),
     refreshSkewSeconds: parseIntEnv('WRAPPER_REFRESH_SKEW_SECONDS', 60),
+    authCodeTtlSeconds: parseIntEnv('OAUTH_AUTH_CODE_TTL_SECONDS', 60),
+    allowedRedirectUris: parseRedirectUris(required('OAUTH_ALLOWED_REDIRECT_URIS')),
   };
 }

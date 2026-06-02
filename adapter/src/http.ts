@@ -1,17 +1,42 @@
-// HTTP surface: OAuth init/callback, MCP endpoint, health, discovery.
+// HTTP surface: full OAuth 2.0 Authorization Server in front of BambooHR.
 //
-// Endpoints (all returned by /.well-known where applicable):
-//   GET  /healthz                              — liveness
-//   GET  /connect/start                        — begin BambooHR OAuth (redirects to BambooHR)
-//   GET  /connect/callback                     — OAuth callback; mints encrypted wrapper bearer
-//   POST /mcp                                  — MCP Streamable HTTP (requires bearer)
-//   POST /disconnect                           — informational only (stateless = nothing to delete)
+// Endpoints:
+//   GET  /healthz                                      — liveness
+//   GET  /authorize                                    — client-facing AS endpoint
+//                                                        (validates client params, redirects user to BambooHR)
+//   GET  /connect/callback                             — BambooHR returns here;
+//                                                        we mint a one-time auth code
+//                                                        and 302 to the client's redirect_uri
+//   POST /token                                        — client exchanges auth code + PKCE verifier
+//                                                        for the wrapper bearer
+//   POST /mcp                                          — MCP Streamable HTTP (requires bearer)
+//   POST /disconnect                                   — informational only (stateless = nothing to delete)
 //   GET  /.well-known/oauth-authorization-server
 //   GET  /.well-known/oauth-protected-resource
-//   POST /register                             — dynamic client registration (stub: returns adapter as the client)
+//   POST /register                                     — dynamic client registration
+//
+// Flow:
+//   1. MCP client (Cursor, etc.) reads /.well-known and POSTs /register.
+//   2. Client browser-redirects user to /authorize?client_id&redirect_uri&state&
+//      response_type=code&code_challenge&code_challenge_method=S256&scope=...
+//   3. /authorize validates client params, encrypts them into an AuthRequest,
+//      302s the user to BambooHR's authorize.php with our AuthRequest as state.
+//   4. BambooHR redirects back to /connect/callback?code&state.
+//   5. /connect/callback decrypts our AuthRequest (recovering the client's
+//      redirect_uri/state/code_challenge), exchanges BambooHR's code for tokens,
+//      mints a wrapper bearer, wraps that bearer in an encrypted AuthCode
+//      containing the PKCE challenge + redirect_uri, then 302s to
+//      <client_redirect_uri>?code=<our_auth_code>&state=<client_state>.
+//   6. Client POSTs /token with grant_type=authorization_code, code, redirect_uri,
+//      code_verifier. We decrypt the code, verify PKCE (sha256(verifier) == cc),
+//      verify redirect_uri match, return the wrapper bearer.
+//   7. Client calls /mcp with Authorization: Bearer <wrapper_bearer>.
+//
+// PKCE S256 is mandatory at /authorize. Redirect URIs must be in the env
+// allowlist. No server-side session state for OAuth.
 
 import express, { type Request, type Response, type NextFunction } from 'express';
-import { randomBytes } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 
 import type { Config } from './config.js';
@@ -20,9 +45,12 @@ import {
   encryptBearer,
   BearerError,
   type BearerPayload,
-  encryptState,
-  decryptState,
-  StateError,
+  encryptAuthRequest,
+  decryptAuthRequest,
+  AuthRequestError,
+  encryptAuthCode,
+  decryptAuthCode,
+  AuthCodeError,
 } from './crypto.js';
 import {
   buildAuthorizeUrl,
@@ -35,11 +63,20 @@ import { makeOAuthClient } from './oauth-bamboohr-client.js';
 import { requestCtx } from './als.js';
 import { buildServer } from './server.js';
 
-// OAuth `state` is a self-contained AES-GCM token (see crypto.ts). No per-pod
-// state store. State lifetime bounds how long a user has to complete the flow.
-const STATE_TTL_SECONDS = 10 * 60;
+// Lifetime of the encrypted AuthRequest (state for the BambooHR round-trip).
+// The user has this many seconds to log in at BambooHR and consent.
+const AUTH_REQUEST_TTL_SECONDS = 10 * 60;
 
-// ----- bearer helpers -----
+// Static client_id used in DCR responses and tolerated at /authorize.
+// Multi-client AS is out of scope for v0.1; we accept any client_id but
+// canonicalize to this one for our own bookkeeping.
+const ADAPTER_CLIENT_ID = 'bamboohr-oauth-mcp';
+
+// ----- helpers -----
+
+function nowSec(): number {
+  return Math.floor(Date.now() / 1000);
+}
 
 function extractBearer(req: Request): string | null {
   const h = req.headers.authorization;
@@ -48,8 +85,17 @@ function extractBearer(req: Request): string | null {
   return m ? m[1].trim() : null;
 }
 
-function nowSec(): number {
-  return Math.floor(Date.now() / 1000);
+function constantTimeEqualStr(a: string, b: string): boolean {
+  const ab = Buffer.from(a, 'utf8');
+  const bb = Buffer.from(b, 'utf8');
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
+
+function verifyPkceS256(verifier: string, expectedChallenge: string): boolean {
+  // RFC 7636: challenge = BASE64URL-ENCODE(SHA256(verifier))
+  const computed = createHash('sha256').update(verifier, 'utf8').digest('base64url');
+  return constantTimeEqualStr(computed, expectedChallenge);
 }
 
 function mintBearer(cfg: Config, token: {
@@ -72,9 +118,6 @@ function mintBearer(cfg: Config, token: {
   return encryptBearer(payload, cfg.encKey);
 }
 
-// Refresh upstream access_token if it expires within refreshSkewSeconds.
-// Returns the (possibly new) payload and a flag indicating whether a new
-// wrapper bearer should be issued to the caller via X-Wrapper-Token.
 async function ensureFreshUpstream(
   cfg: Config,
   payload: BearerPayload,
@@ -99,14 +142,18 @@ async function ensureFreshUpstream(
   return { payload: newPayload, rotated: true };
 }
 
+// Append query params without reflowing the URL; preserves fragments/etc.
+function appendQuery(url: string, params: Record<string, string>): string {
+  const u = new URL(url);
+  for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
+  return u.toString();
+}
+
 // ----- app factory -----
 
 export function buildApp(cfg: Config): express.Express {
   const app = express();
   app.disable('x-powered-by');
-  // Body parsing: MCP requests are JSON. Token endpoint isn't used by clients here
-  // (we expose .well-known but the actual token mint happens via the callback
-  // redirect, not a separate /token POST). Keep the limit generous for tool args.
   app.use(express.json({ limit: '4mb' }));
   app.use(express.urlencoded({ extended: false }));
 
@@ -122,18 +169,69 @@ export function buildApp(cfg: Config): express.Express {
     });
   });
 
-  // --- OAuth: start ---
-  app.get('/connect/start', (_req, res) => {
+  // --- OAuth AS: /authorize ---------------------------------------------
+  app.get('/authorize', (req, res) => {
+    const q = (k: string): string | null => {
+      const v = req.query[k];
+      return typeof v === 'string' && v.length > 0 ? v : null;
+    };
+
+    const responseType = q('response_type');
+    const clientId = q('client_id');
+    const redirectUriRaw = q('redirect_uri');
+    const clientState = q('state') ?? '';
+    const codeChallenge = q('code_challenge');
+    const codeChallengeMethod = q('code_challenge_method');
+    const scope = q('scope') ?? '';
+
+    if (responseType !== 'code') {
+      res.status(400).json({ error: 'unsupported_response_type', detail: 'only response_type=code is supported' });
+      return;
+    }
+    if (!clientId) {
+      res.status(400).json({ error: 'invalid_request', detail: 'client_id is required' });
+      return;
+    }
+    if (!redirectUriRaw) {
+      res.status(400).json({ error: 'invalid_request', detail: 'redirect_uri is required' });
+      return;
+    }
+    if (!cfg.allowedRedirectUris.includes(redirectUriRaw)) {
+      // Do NOT redirect on an invalid redirect_uri (open redirect avoidance).
+      // Render a plain error so the user/admin can see the mismatch.
+      res.status(400).json({
+        error: 'invalid_redirect_uri',
+        detail: `redirect_uri "${redirectUriRaw}" is not in OAUTH_ALLOWED_REDIRECT_URIS`,
+      });
+      return;
+    }
+    if (!codeChallenge || codeChallengeMethod !== 'S256') {
+      res.status(400).json({
+        error: 'invalid_request',
+        detail: 'PKCE is required: supply code_challenge and code_challenge_method=S256',
+      });
+      return;
+    }
+
     const iat = nowSec();
-    const state = encryptState(
-      { v: 1, iat, exp: iat + STATE_TTL_SECONDS, n: randomBytes(16).toString('base64url') },
+    const stateToken = encryptAuthRequest(
+      {
+        v: 1,
+        iat,
+        exp: iat + AUTH_REQUEST_TTL_SECONDS,
+        ci: clientId,
+        ru: redirectUriRaw,
+        cs: clientState,
+        cc: codeChallenge,
+        sc: scope,
+      },
       cfg.encKey,
     );
-    const url = buildAuthorizeUrl(cfg, state);
-    res.redirect(302, url);
+
+    res.redirect(302, buildAuthorizeUrl(cfg, stateToken));
   });
 
-  // --- OAuth: callback ---
+  // --- BambooHR callback ------------------------------------------------
   app.get('/connect/callback', async (req, res) => {
     const code = typeof req.query.code === 'string' ? req.query.code : null;
     const stateRaw = typeof req.query.state === 'string' ? req.query.state : null;
@@ -148,63 +246,138 @@ export function buildApp(cfg: Config): express.Express {
       return;
     }
 
+    let authReq;
     try {
-      const state = decryptState(stateRaw, cfg.encKey);
-      if (state.exp < nowSec()) {
-        res.status(400).json({ error: 'state_expired' });
-        return;
-      }
+      authReq = decryptAuthRequest(stateRaw, cfg.encKey);
     } catch (e) {
-      if (e instanceof StateError) {
+      if (e instanceof AuthRequestError) {
         res.status(400).json({ error: 'invalid_state', detail: e.message });
         return;
       }
       throw e;
     }
 
+    if (authReq.exp < nowSec()) {
+      res.status(400).json({ error: 'state_expired' });
+      return;
+    }
+
+    // Re-verify the redirect_uri is still in the allowlist. (Config could have
+    // changed between /authorize and the callback; reject rather than honor a
+    // stale URI.)
+    if (!cfg.allowedRedirectUris.includes(authReq.ru)) {
+      res.status(400).json({
+        error: 'invalid_redirect_uri',
+        detail: 'redirect_uri from original /authorize is no longer in the allowlist',
+      });
+      return;
+    }
+
+    let token;
     try {
-      const token = await exchangeCodeForToken(cfg, code);
-
-      // If BambooHR returns a companyDomain on the token, ensure it matches our
-      // configured single-tenant. Don't reject silently — return a clear error.
-      if (token.companyDomain && token.companyDomain !== cfg.companyDomain) {
-        res.status(400).json({
-          error: 'tenant_mismatch',
-          detail: `token issued for "${token.companyDomain}", adapter is configured for "${cfg.companyDomain}"`,
-        });
-        return;
-      }
-
-      const bearer = mintBearer(cfg, {
-        access_token: token.access_token,
-        refresh_token: token.refresh_token ?? null,
-        expires_in: token.expires_in,
-        scope: token.scope,
-      });
-
-      // Render bearer plainly. Wrapping this in a nicer HTML page is a UX
-      // improvement, not a correctness one. The MCP client typically scrapes
-      // this from the redirect chain or from an in-process flow.
-      res.json({
-        token_type: 'Bearer',
-        access_token: bearer,
-        expires_in: cfg.bearerTtlSeconds,
-        scope: token.scope,
-      });
+      token = await exchangeCodeForToken(cfg, code);
     } catch (e) {
       if (e instanceof OAuthError) {
+        // We cannot safely redirect to the client without the state context;
+        // surface the error to the user/admin here.
         res.status(e.status ?? 502).json({ error: 'oauth_exchange_failed', detail: e.message });
-      } else {
-        res.status(500).json({ error: 'internal_error', detail: (e as Error).message });
+        return;
       }
+      throw e;
     }
+
+    if (token.companyDomain && token.companyDomain !== cfg.companyDomain) {
+      res.status(400).json({
+        error: 'tenant_mismatch',
+        detail: `token issued for "${token.companyDomain}", adapter is configured for "${cfg.companyDomain}"`,
+      });
+      return;
+    }
+
+    const bearer = mintBearer(cfg, {
+      access_token: token.access_token,
+      refresh_token: token.refresh_token ?? null,
+      expires_in: token.expires_in,
+      scope: token.scope,
+    });
+
+    const iat = nowSec();
+    const authCode = encryptAuthCode(
+      {
+        v: 1,
+        iat,
+        exp: iat + cfg.authCodeTtlSeconds,
+        b: bearer,
+        ru: authReq.ru,
+        cc: authReq.cc,
+        eb: iat + cfg.bearerTtlSeconds,
+        sc: token.scope,
+      },
+      cfg.encKey,
+    );
+
+    const redirect = appendQuery(authReq.ru, {
+      code: authCode,
+      state: authReq.cs,
+    });
+    res.redirect(302, redirect);
+  });
+
+  // --- OAuth AS: /token --------------------------------------------------
+  app.post('/token', (req, res) => {
+    // Accept both x-www-form-urlencoded (per RFC 6749) and JSON for convenience.
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const grantType = typeof body.grant_type === 'string' ? body.grant_type : null;
+    const code = typeof body.code === 'string' ? body.code : null;
+    const redirectUriIn = typeof body.redirect_uri === 'string' ? body.redirect_uri : null;
+    const codeVerifier = typeof body.code_verifier === 'string' ? body.code_verifier : null;
+
+    if (grantType !== 'authorization_code') {
+      res.status(400).json({ error: 'unsupported_grant_type' });
+      return;
+    }
+    if (!code || !redirectUriIn || !codeVerifier) {
+      res
+        .status(400)
+        .json({ error: 'invalid_request', detail: 'code, redirect_uri, and code_verifier are required' });
+      return;
+    }
+
+    let authCode;
+    try {
+      authCode = decryptAuthCode(code, cfg.encKey);
+    } catch (e) {
+      if (e instanceof AuthCodeError) {
+        res.status(400).json({ error: 'invalid_grant', detail: e.message });
+        return;
+      }
+      throw e;
+    }
+
+    if (authCode.exp < nowSec()) {
+      res.status(400).json({ error: 'invalid_grant', detail: 'authorization code expired' });
+      return;
+    }
+    if (!constantTimeEqualStr(authCode.ru, redirectUriIn)) {
+      res.status(400).json({ error: 'invalid_grant', detail: 'redirect_uri mismatch' });
+      return;
+    }
+    if (!verifyPkceS256(codeVerifier, authCode.cc)) {
+      res.status(400).json({ error: 'invalid_grant', detail: 'PKCE verification failed' });
+      return;
+    }
+
+    const expiresIn = Math.max(0, authCode.eb - nowSec());
+    res.json({
+      access_token: authCode.b,
+      token_type: 'Bearer',
+      expires_in: expiresIn,
+      scope: authCode.sc,
+    });
   });
 
   // --- Disconnect (stateless) ---
   app.post('/disconnect', (_req, res) => {
-    // No server-side session to delete. Client should drop its bearer.
-    // BambooHR's OAuth does not (publicly) document a revoke endpoint; if/when
-    // one is exposed, call it here using the refresh_token.
     res.json({ status: 'ok', note: 'stateless adapter: discard the bearer client-side' });
   });
 
@@ -253,7 +426,6 @@ export function buildApp(cfg: Config): express.Express {
       const newBearer = mintBearer(cfg, {
         access_token: payload.at,
         refresh_token: payload.rt,
-        // Keep wrapper TTL fresh on refresh too; upstream just rotated, so it's safe.
         expires_in: payload.ate - nowSec(),
         scope: payload.s,
       });
@@ -265,7 +437,6 @@ export function buildApp(cfg: Config): express.Express {
       companyDomain: cfg.companyDomain,
     });
 
-    // Stateless transport per request (matches upstream behavior in dist/index.js).
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,
@@ -282,19 +453,17 @@ export function buildApp(cfg: Config): express.Express {
     }
   });
 
-  // --- .well-known discovery (best-effort MCP client compatibility) ---
-  // These are intentionally minimal: the adapter is itself the AS for wrapper
-  // bearers, and the BambooHR-side OAuth is opaque to MCP clients.
+  // --- .well-known discovery ---
   app.get('/.well-known/oauth-authorization-server', (_req, res) => {
     res.json({
       issuer: cfg.publicBaseUrl,
-      authorization_endpoint: `${cfg.publicBaseUrl}/connect/start`,
-      // No separate token endpoint: callback returns the bearer directly.
-      token_endpoint: `${cfg.publicBaseUrl}/connect/callback`,
+      authorization_endpoint: `${cfg.publicBaseUrl}/authorize`,
+      token_endpoint: `${cfg.publicBaseUrl}/token`,
       registration_endpoint: `${cfg.publicBaseUrl}/register`,
       response_types_supported: ['code'],
       grant_types_supported: ['authorization_code'],
       token_endpoint_auth_methods_supported: ['none'],
+      code_challenge_methods_supported: ['S256'],
       scopes_supported: cfg.oauthScopes.split('+'),
     });
   });
@@ -307,16 +476,43 @@ export function buildApp(cfg: Config): express.Express {
     });
   });
 
-  app.post('/register', (_req, res) => {
-    // Dynamic client registration stub: this adapter is single-tenant and has
-    // a fixed BambooHR client. Return a static client_id so MCP clients that
-    // require DCR can proceed.
-    res.json({
-      client_id: 'bamboohr-oauth-mcp',
+  // --- Dynamic Client Registration (RFC 7591) ---
+  // Accept the client's requested redirect_uris, validate each against the
+  // env allowlist, and echo back. We do not persist anything; client_id is
+  // a static label.
+  app.post('/register', (req, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const requested = Array.isArray(body.redirect_uris) ? body.redirect_uris : [];
+    const uris: string[] = [];
+    for (const u of requested) {
+      if (typeof u !== 'string') {
+        res.status(400).json({ error: 'invalid_redirect_uri', detail: 'redirect_uris must be strings' });
+        return;
+      }
+      if (!cfg.allowedRedirectUris.includes(u)) {
+        res.status(400).json({
+          error: 'invalid_redirect_uri',
+          detail: `redirect_uri "${u}" is not in OAUTH_ALLOWED_REDIRECT_URIS`,
+        });
+        return;
+      }
+      uris.push(u);
+    }
+    // If the client sent no redirect_uris, echo the entire allowlist so
+    // discovery-only clients can pick one.
+    if (uris.length === 0) uris.push(...cfg.allowedRedirectUris);
+
+    res.status(201).json({
+      client_id: ADAPTER_CLIENT_ID,
       token_endpoint_auth_method: 'none',
-      redirect_uris: [redirectUri(cfg)],
+      grant_types: ['authorization_code'],
+      response_types: ['code'],
+      redirect_uris: uris,
     });
   });
+
+  // Keep the upstream redirectUri helper alive (used elsewhere); silence unused.
+  void redirectUri;
 
   // --- Error handler ---
   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
