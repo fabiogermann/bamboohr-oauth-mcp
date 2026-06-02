@@ -438,7 +438,12 @@ describe('http / /mcp auth gating', () => {
     const res = await request(app).post('/mcp').set('content-type', 'application/json').send({});
     expect(res.status).toBe(401);
     expect(res.body.error).toBe('missing_bearer');
-    expect(res.headers['www-authenticate']).toMatch(/Bearer/);
+    const wa = res.headers['www-authenticate'];
+    expect(wa).toMatch(/^Bearer realm=/);
+    // MCP clients require resource_metadata to discover the OAuth flow.
+    expect(wa).toContain('resource_metadata="');
+    expect(wa).toContain('/.well-known/oauth-protected-resource');
+    expect(wa).toContain('error="invalid_token"');
   });
 
   it('rejects a malformed bearer', async () => {
@@ -449,6 +454,7 @@ describe('http / /mcp auth gating', () => {
       .send({});
     expect(res.status).toBe(401);
     expect(res.body.error).toBe('invalid_bearer');
+    expect(res.headers['www-authenticate']).toContain('resource_metadata=');
   });
 
   it('rejects an expired wrapper bearer', async () => {

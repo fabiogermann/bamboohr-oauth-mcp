@@ -391,12 +391,27 @@ export function buildApp(cfg: Config): express.Express {
   });
 
   // --- MCP endpoint ---
+  //
+  // The WWW-Authenticate header on every 401 MUST include a `resource_metadata`
+  // pointer per the MCP spec (which inherits from RFC 9728, OAuth 2.0 Protected
+  // Resource Metadata). Without it MCP clients (Cursor, Claude Desktop, ...)
+  // cannot discover the authorization server and fail with a generic empty-message
+  // "Transient error connecting to streamableHttp server" instead of starting
+  // the OAuth flow. The `error=` token is RFC 6750 §3.1.
+  const resourceMetadataUrl = `${cfg.publicBaseUrl}/.well-known/oauth-protected-resource`;
+  const wwwAuth = (errCode: string, description?: string): string => {
+    const parts = [`Bearer realm="bamboohr-mcp"`, `resource_metadata="${resourceMetadataUrl}"`, `error="${errCode}"`];
+    if (description) parts.push(`error_description="${description.replace(/"/g, "'")}"`);
+    return parts.join(', ');
+  };
+
   app.post('/mcp', async (req: Request, res: Response, next: NextFunction) => {
     const raw = extractBearer(req);
     if (!raw) {
-      res.status(401).set('WWW-Authenticate', 'Bearer realm="bamboohr-mcp"').json({
-        error: 'missing_bearer',
-      });
+      res
+        .status(401)
+        .set('WWW-Authenticate', wwwAuth('invalid_token', 'missing bearer'))
+        .json({ error: 'missing_bearer' });
       return;
     }
 
@@ -405,7 +420,10 @@ export function buildApp(cfg: Config): express.Express {
       payload = decryptBearer(raw, cfg.encKey);
     } catch (e) {
       if (e instanceof BearerError) {
-        res.status(401).json({ error: 'invalid_bearer', detail: e.message });
+        res
+          .status(401)
+          .set('WWW-Authenticate', wwwAuth('invalid_token', e.message))
+          .json({ error: 'invalid_bearer', detail: e.message });
         return;
       }
       next(e);
@@ -413,7 +431,10 @@ export function buildApp(cfg: Config): express.Express {
     }
 
     if (payload.exp < nowSec()) {
-      res.status(401).json({ error: 'bearer_expired' });
+      res
+        .status(401)
+        .set('WWW-Authenticate', wwwAuth('invalid_token', 'bearer expired'))
+        .json({ error: 'bearer_expired' });
       return;
     }
 
