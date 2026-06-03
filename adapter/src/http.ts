@@ -36,7 +36,7 @@
 // allowlist. No server-side session state for OAuth.
 
 import express, { type Request, type Response, type NextFunction } from 'express';
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 
 import type { Config } from './config.js';
@@ -165,6 +165,39 @@ export function buildApp(cfg: Config): express.Express {
   app.disable('x-powered-by');
   app.use(express.json({ limit: '4mb' }));
   app.use(express.urlencoded({ extended: false }));
+
+  // Request logging. Always on at INFO level: one line per request with method,
+  // path, status, duration, content-length. Set LOG_LEVEL=debug to also dump
+  // the Authorization header presence, query keys, and (for /register & /token)
+  // the redacted request body. This is invaluable for diagnosing MCP client
+  // OAuth flows where the client's logs are uninformative.
+  const debug = (process.env.LOG_LEVEL || '').toLowerCase() === 'debug';
+  app.use((req, res, next) => {
+    const start = Date.now();
+    const reqId = randomBytes(4).toString('hex');
+    const tag = `[${reqId}]`;
+    if (debug) {
+      const authPresent = req.headers.authorization ? 'auth=Bearer***' : 'auth=-';
+      const qs = Object.keys(req.query).length ? ` q=${Object.keys(req.query).join(',')}` : '';
+      // eslint-disable-next-line no-console
+      console.error(`${tag} -> ${req.method} ${req.path} ${authPresent}${qs} ua="${(req.headers['user-agent'] || '').slice(0, 80)}"`);
+      if ((req.path === '/register' || req.path === '/token') && req.body) {
+        const redacted = { ...req.body };
+        for (const k of ['client_secret', 'code_verifier', 'code', 'access_token', 'refresh_token']) {
+          if (redacted[k]) redacted[k] = '***';
+        }
+        // eslint-disable-next-line no-console
+        console.error(`${tag}    body=${JSON.stringify(redacted).slice(0, 500)}`);
+      }
+    }
+    res.on('finish', () => {
+      const ms = Date.now() - start;
+      const len = res.getHeader('content-length') ?? '-';
+      // eslint-disable-next-line no-console
+      console.error(`${tag} <- ${req.method} ${req.path} ${res.statusCode} ${ms}ms len=${len}`);
+    });
+    next();
+  });
 
   const server = buildServer();
 
@@ -404,6 +437,25 @@ export function buildApp(cfg: Config): express.Express {
     if (description) parts.push(`error_description="${description.replace(/"/g, "'")}"`);
     return parts.join(', ');
   };
+
+  // Some MCP clients probe GET/DELETE/OPTIONS on /mcp to discover transport
+  // capabilities or terminate sessions. Express defaults to 404 with a text/html
+  // body that the client cannot interpret. Return a structured response that
+  // also carries WWW-Authenticate so the auth path is still discoverable.
+  app.get('/mcp', (_req, res) => {
+    res
+      .status(405)
+      .set('Allow', 'POST')
+      .set('WWW-Authenticate', wwwAuth('invalid_token', 'method not allowed; use POST'))
+      .json({ error: 'method_not_allowed', allowed: ['POST'] });
+  });
+  app.delete('/mcp', (_req, res) => {
+    // No stateful sessions to terminate; acknowledge to keep clients happy.
+    res.status(200).json({ status: 'ok', note: 'stateless adapter: nothing to terminate' });
+  });
+  app.options('/mcp', (_req, res) => {
+    res.set('Allow', 'POST, OPTIONS, DELETE').status(204).end();
+  });
 
   app.post('/mcp', async (req: Request, res: Response, next: NextFunction) => {
     const raw = extractBearer(req);
