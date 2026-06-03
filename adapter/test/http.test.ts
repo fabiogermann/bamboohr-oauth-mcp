@@ -127,6 +127,17 @@ describe('http / .well-known', () => {
     expect(res.body.resource).toBe('https://adapter.example.com/mcp');
     expect(res.body.bearer_methods_supported).toContain('header');
   });
+
+  it('serves protected-resource metadata at path-suffixed /mcp variant (RFC 9728)', async () => {
+    const res = await request(app).get('/.well-known/oauth-protected-resource/mcp');
+    expect(res.status).toBe(200);
+    expect(res.body.resource).toBe('https://adapter.example.com/mcp');
+  });
+
+  it('advertises refresh_token grant in AS metadata', async () => {
+    const res = await request(app).get('/.well-known/oauth-authorization-server');
+    expect(res.body.grant_types_supported).toContain('refresh_token');
+  });
 });
 
 // ----- /authorize -----
@@ -414,6 +425,21 @@ describe('http / /register', () => {
     const res = await request(app).post('/register').send({ redirect_uris: ['http://evil/cb'] });
     expect(res.status).toBe(400);
     expect(res.body.error).toBe('invalid_redirect_uri');
+  });
+
+  it('filters out unknown redirect_uris when at least one is allowed (Cursor sends 3)', async () => {
+    const res = await request(app)
+      .post('/register')
+      .send({ redirect_uris: [REDIRECT_URI, 'http://evil/cb', 'https://other/cb'] });
+    expect(res.status).toBe(201);
+    expect(res.body.redirect_uris).toEqual([REDIRECT_URI]);
+  });
+
+  it('advertises refresh_token grant and client_id_issued_at', async () => {
+    const res = await request(app).post('/register').send({ redirect_uris: [REDIRECT_URI] });
+    expect(res.status).toBe(201);
+    expect(res.body.grant_types).toEqual(['authorization_code', 'refresh_token']);
+    expect(typeof res.body.client_id_issued_at).toBe('number');
   });
 
   it('returns the entire allowlist when client sent none', async () => {

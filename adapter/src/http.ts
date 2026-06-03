@@ -543,19 +543,29 @@ export function buildApp(cfg: Config): express.Express {
       token_endpoint: `${cfg.publicBaseUrl}/token`,
       registration_endpoint: `${cfg.publicBaseUrl}/register`,
       response_types_supported: ['code'],
-      grant_types_supported: ['authorization_code'],
+      grant_types_supported: ['authorization_code', 'refresh_token'],
       token_endpoint_auth_methods_supported: ['none'],
       code_challenge_methods_supported: ['S256'],
       scopes_supported: cfg.oauthScopes.split('+'),
     });
   });
 
+  // RFC 9728 §3.1: protected-resource metadata can be served at the root
+  // (/.well-known/oauth-protected-resource) AND at a path-suffixed location
+  // matching the resource (/.well-known/oauth-protected-resource/<path>).
+  // Cursor probes the suffixed variant for the `/mcp` resource. Serve the
+  // same metadata for both so clients can discover regardless of which
+  // convention they follow.
+  const protectedResourceMetadata = {
+    resource: `${cfg.publicBaseUrl}/mcp`,
+    authorization_servers: [cfg.publicBaseUrl],
+    bearer_methods_supported: ['header'],
+  };
   app.get('/.well-known/oauth-protected-resource', (_req, res) => {
-    res.json({
-      resource: `${cfg.publicBaseUrl}/mcp`,
-      authorization_servers: [cfg.publicBaseUrl],
-      bearer_methods_supported: ['header'],
-    });
+    res.json(protectedResourceMetadata);
+  });
+  app.get('/.well-known/oauth-protected-resource/mcp', (_req, res) => {
+    res.json(protectedResourceMetadata);
   });
 
   // --- Dynamic Client Registration (RFC 7591) ---
@@ -565,29 +575,39 @@ export function buildApp(cfg: Config): express.Express {
   app.post('/register', (req, res) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const requested = Array.isArray(body.redirect_uris) ? body.redirect_uris : [];
-    const uris: string[] = [];
+    // RFC 7591 implicitly assumes the AS will accept the URIs it can support.
+    // Real-world MCP clients (Cursor, Claude Desktop) send several alternative
+    // callback URIs at once (custom scheme + https fallback + localhost dev).
+    // Reject only if NONE of them are in our allowlist; otherwise echo back the
+    // intersection. This lets the client pick the supported one at /authorize.
+    const filtered: string[] = [];
+    const rejected: string[] = [];
     for (const u of requested) {
       if (typeof u !== 'string') {
         res.status(400).json({ error: 'invalid_redirect_uri', detail: 'redirect_uris must be strings' });
         return;
       }
-      if (!cfg.allowedRedirectUris.includes(u)) {
-        res.status(400).json({
-          error: 'invalid_redirect_uri',
-          detail: `redirect_uri "${u}" is not in OAUTH_ALLOWED_REDIRECT_URIS`,
-        });
-        return;
-      }
-      uris.push(u);
+      if (cfg.allowedRedirectUris.includes(u)) filtered.push(u);
+      else rejected.push(u);
+    }
+    if (requested.length > 0 && filtered.length === 0) {
+      res.status(400).json({
+        error: 'invalid_redirect_uri',
+        detail: `none of the requested redirect_uris are in OAUTH_ALLOWED_REDIRECT_URIS`,
+        requested: rejected,
+        allowed: cfg.allowedRedirectUris,
+      });
+      return;
     }
     // If the client sent no redirect_uris, echo the entire allowlist so
     // discovery-only clients can pick one.
-    if (uris.length === 0) uris.push(...cfg.allowedRedirectUris);
+    const uris = filtered.length > 0 ? filtered : [...cfg.allowedRedirectUris];
 
     res.status(201).json({
       client_id: ADAPTER_CLIENT_ID,
+      client_id_issued_at: Math.floor(Date.now() / 1000),
       token_endpoint_auth_method: 'none',
-      grant_types: ['authorization_code'],
+      grant_types: ['authorization_code', 'refresh_token'],
       response_types: ['code'],
       redirect_uris: uris,
     });
