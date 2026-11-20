@@ -1,16 +1,15 @@
 # syntax=docker/dockerfile:1.7
 
 # ---- Build stage: install deps, compile TypeScript, prune to prod ----
-FROM node:22-alpine AS builder
+FROM node:26-alpine AS builder
 
 WORKDIR /build
 
 # Install ALL deps (incl. devDependencies needed for tsc) using package.json
 # only first, so the layer cache reflects only manifest changes.
-COPY adapter/package.json adapter/package-lock.json* ./
-# `npm ci` would be ideal but the lockfile is .gitignore'd in dev; fall back
-# to `npm install` for now. Replace with `npm ci` once we ship a lockfile.
-RUN npm install --no-audit --no-fund
+COPY adapter/package.json adapter/package-lock.json ./
+# Lockfile is tracked in the repo, so a reproducible `npm ci` works here.
+RUN npm ci --no-audit --no-fund
 
 # Copy sources and build.
 COPY adapter/tsconfig.json ./
@@ -21,7 +20,7 @@ RUN npx tsc
 RUN npm prune --omit=dev
 
 # ---- Runtime stage: minimal, non-root ----
-FROM node:22-alpine AS runtime
+FROM node:26-alpine AS runtime
 
 # tini handles PID 1 signal forwarding (K8s SIGTERM).
 RUN apk add --no-cache tini \
