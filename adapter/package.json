@@ -1,6 +1,6 @@
 {
   "name": "bamboohr-oauth-mcp",
-  "version": "0.1.0",
+  "version": "0.10.0",
   "private": true,
   "description": "OAuth-aware adapter around @twentytwokhz/bamboohr-mcp: terminates BambooHR OAuth, encrypts per-user bearer, runs MCP server with per-request credentials.",
   "license": "LGPL-2.1-only",
